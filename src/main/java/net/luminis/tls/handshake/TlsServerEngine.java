@@ -105,11 +105,14 @@ public class TlsServerEngine extends TlsEngine implements ServerMessageProcessor
 
         // This implementation (yet) only supports secp256r1 and x25519
         List<TlsConstants.NamedGroup> serverSupportedGroups = List.of(TlsConstants.NamedGroup.secp256r1, x25519);
+        List<TlsConstants.NamedGroup> commonSupportedGroup;
         if (supportedGroupsExt.getNamedGroups().stream()
                 .filter(serverSupportedGroups::contains)
                 .findFirst()
                 .isEmpty()) {
             throw new HandshakeFailureAlert(String.format("Failed to negotiate supported group (server only supports %s)", serverSupportedGroups));
+        } else {
+            commonSupportedGroup = supportedGroupsExt.getNamedGroups().stream().filter(serverSupportedGroups::contains).collect(Collectors.toList());
         }
 
         KeyShareExtension keyShareExtension = (KeyShareExtension) clientHello.getExtensions().stream()
@@ -117,17 +120,37 @@ public class TlsServerEngine extends TlsEngine implements ServerMessageProcessor
                 .findFirst()
                 .orElseThrow(() -> new MissingExtensionAlert("key share extension is required in Client Hello"));
 
-        KeyShareExtension.KeyShareEntry keyShareEntry = keyShareExtension.getKeyShareEntries().stream()
+        Optional<KeyShareExtension.KeyShareEntry> keyShareEntry = keyShareExtension.getKeyShareEntries().stream()
                 .filter(entry -> serverSupportedGroups.contains(entry.getNamedGroup()))
-                .findFirst()
-                .orElseThrow(() -> new IllegalParameterAlert("key share named group not supported (and no HelloRetryRequest support)"));
+                .findFirst();
 
-       SignatureAlgorithmsExtension signatureAlgorithmsExtension = (SignatureAlgorithmsExtension) clientHello.getExtensions().stream()
+        if (!keyShareEntry.isPresent()){
+            List<Extension> extensions = List.of(
+                    new SupportedVersionsExtension(TlsConstants.HandshakeType.server_hello),
+                    new KeyShareExtension(null, commonSupportedGroup.get(0), TlsConstants.HandshakeType.server_hello)
+            );
+            HelloRetryRequest helloRetryRequest = new HelloRetryRequest(selectedCipher, extensions);
+            serverMessageSender.send(helloRetryRequest);
+
+            TranscriptHash transcriptHashCH1 = new TranscriptHash(hashLength(selectedCipher));
+            transcriptHashCH1.record(clientHello);
+            byte[] hashCH1 = transcriptHashCH1.getHash(TlsConstants.HandshakeType.client_hello);
+            HandshakeMessage syntheticMsg = new MessageHash(hashCH1);
+
+            transcriptHash = new TranscriptHash(hashLength(selectedCipher));
+            transcriptHash.record(syntheticMsg);
+            transcriptHash.recordHelloRetryRequest(helloRetryRequest);
+
+            status = Status.Start;
+            return;
+        }
+
+        SignatureAlgorithmsExtension signatureAlgorithmsExtension = (SignatureAlgorithmsExtension) clientHello.getExtensions().stream()
                 .filter(ext -> ext instanceof SignatureAlgorithmsExtension)
                 .findFirst()
                 .orElseThrow(() -> new MissingExtensionAlert("signature algorithms extension is required in Client Hello"));
 
-       clientHello.getExtensions().stream()
+        clientHello.getExtensions().stream()
                .filter(ext -> ext instanceof PskKeyExchangeModesExtension)
                .findFirst()
                .ifPresent(extension -> {
@@ -168,7 +191,9 @@ public class TlsServerEngine extends TlsEngine implements ServerMessageProcessor
                         //  and validate solely the binder that corresponds to that PSK."
                         TlsSession resumedSession = sessionRegistry.useSession(preSharedKeyExtension.getIdentities().get(selectedIdentity));
                         if (resumedSession != null) {
-                            transcriptHash = new TranscriptHash(hashLength(selectedCipher));
+                            if (transcriptHash == null){
+                                transcriptHash = new TranscriptHash(hashLength(selectedCipher));
+                            }
                             state = new TlsState(transcriptHash, resumedSession.getPsk(), keyLength(selectedCipher), hashLength(selectedCipher));
                             if (!validateBinder(preSharedKeyExtension.getBinders().get(selectedIdentity), preSharedKeyExtension.getBinderPosition(), clientHello)) {
                                 state = null;
@@ -197,21 +222,23 @@ public class TlsServerEngine extends TlsEngine implements ServerMessageProcessor
         }
         if (state == null) {
             // Resumption was not requested or not successful; init TLS state without PSK.
-            transcriptHash = new TranscriptHash(hashLength(selectedCipher));
+            if (transcriptHash == null){
+                transcriptHash = new TranscriptHash(hashLength(selectedCipher));
+            }
             state = new TlsState(transcriptHash, keyLength(selectedCipher), hashLength(selectedCipher));
             // The selectedIdentity indicates which PSK was used to resume the session; it must be null when session is not resumed.
             selectedIdentity = null;
         }
         transcriptHash.record(clientHello);
 
-        generateKeys(keyShareEntry.getNamedGroup());
+        generateKeys(keyShareEntry.get().getNamedGroup());
         state.setOwnKey(privateKey);
         state.computeEarlyTrafficSecret();
         statusHandler.earlySecretsKnown();
 
         List<Extension> extensions = List.of(
                 new SupportedVersionsExtension(TlsConstants.HandshakeType.server_hello),
-                new KeyShareExtension(publicKey, keyShareEntry.getNamedGroup(), TlsConstants.HandshakeType.server_hello));
+                new KeyShareExtension(publicKey, keyShareEntry.get().getNamedGroup(), TlsConstants.HandshakeType.server_hello));
         if (selectedIdentity != null) {
             extensions = new ArrayList<>(extensions);
             extensions.add(new ServerPreSharedKeyExtension(selectedIdentity.shortValue()));
@@ -223,7 +250,7 @@ public class TlsServerEngine extends TlsEngine implements ServerMessageProcessor
 
         // Update state
         transcriptHash.record(serverHello);
-        state.setPeerKey(keyShareEntry.getKey());
+        state.setPeerKey(keyShareEntry.get().getKey());
 
         // Compute keys
         state.computeSharedSecret();
